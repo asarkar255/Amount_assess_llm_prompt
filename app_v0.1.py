@@ -21,7 +21,7 @@ from langchain_core.output_parsers import JsonOutputParser
 
 app = FastAPI(title="AFLE Amount Assessment & LLM Prompt (LangChain, no fallback)")
 
-# ====== Models (amount version, no start/end lines in input) ======
+# ====== Models (amount version) ======
 class Finding(BaseModel):
     pgm_name: Optional[str] = None
     inc_name: Optional[str] = None
@@ -41,6 +41,8 @@ class Unit(BaseModel):
     type: str
     name: Optional[str] = ""
     class_implementation: Optional[str] = ""
+    start_line: Optional[int] = 0
+    end_line: Optional[int] = 0
     code: Optional[str] = ""
     amount_findings: Optional[List[Finding]] = Field(default=None)
 
@@ -61,6 +63,7 @@ def summarize_amount_findings(unit: Unit) -> Dict[str, Any]:
         "include": unit.inc_name,
         "unit_type": unit.type,
         "unit_name": unit.name or "",
+        "range": {"start_line": unit.start_line or 0, "end_line": unit.end_line or 0},
         "stats": {
             "count": len(findings),
             "severity_counts": sev_counts,
@@ -80,7 +83,7 @@ Goal:
    Summarize risks and why they matter for S/4HANA Amount Field Length Extension (AFLE).
    Consider guidance from SAP notes like 2628654 (S4TWL: Amount Field Length Extension), 2628040 (General info), and 2610650 (Code Adaptations).
 2) Produce a **remediation LLM prompt** to be used later. The prompt must:
-   - Reference the unit metadata (program/include/unit).
+   - Reference the unit metadata (program/include/unit/lines if provided).
    - Ask for minimal, behavior-preserving ECC-safe changes (no 7.4+ syntax) focused strictly on AFLE risks
      (e.g., type conflicts in modularization calls/Open SQL/LOOP/READ, MOVE/MOVE-CORRESPONDING issues,
       WRITE/WRITE TO layout, floating-point rounding, arithmetic error handling, hardcoded min/max, data clusters, ALV extracts).
@@ -98,6 +101,8 @@ Unit metadata:
 - Include: {inc_name}
 - Unit type: {unit_type}
 - Unit name: {unit_name}
+- Start line: {start_line}
+- End line: {end_line}
 
 ABAP code (optional; may be empty):
 {code}
@@ -132,6 +137,8 @@ def llm_assess_and_prompt(unit: Unit) -> Dict[str, str]:
                 "inc_name": unit.inc_name,
                 "unit_type": unit.type,
                 "unit_name": unit.name or "",
+                "start_line": unit.start_line or 0,
+                "end_line": unit.end_line or 0,
                 "code": unit.code or "",
                 "plan_json": plan_json,
                 "findings_json": findings_json,
@@ -163,4 +170,3 @@ def assess_and_prompt_amount(units: List[Unit]) -> List[Dict[str, Any]]:
 @app.get("/health")
 def health():
     return {"ok": True, "model": OPENAI_MODEL}
-
