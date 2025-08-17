@@ -79,13 +79,13 @@ Goal:
 1) Turn 'amount_findings' into a concise, human-readable **assessment** paragraph for a reporting file (no code changes now).
    Summarize risks and why they matter for S/4HANA Amount Field Length Extension (AFLE).
    Consider guidance from SAP notes like 2628654 (S4TWL: Amount Field Length Extension), 2628040 (General info), and 2610650 (Code Adaptations).
-2) Produce a **remediation LLM prompt** to be used later. The prompt must:
-   - Reference the unit metadata (program/include/unit).
-   - Ask for minimal, behavior-preserving ECC-safe changes (no 7.4+ syntax) focused strictly on AFLE risks
-     (e.g., type conflicts in modularization calls/Open SQL/LOOP/READ, MOVE/MOVE-CORRESPONDING issues,
-      WRITE/WRITE TO layout, floating-point rounding, arithmetic error handling, hardcoded min/max, data clusters, ALV extracts).
-   - Require output JSON with keys: original_code, remediated_code, changes[] (line, before, after, reason).
-   - No business logic changes, no suppressions, no pseudo-comments.
+2) Produce a **remediation LLM prompt** to be used later.  
+   The prompt must be concise, to the point, and contain **no more than 5 numbered bullet points**.  
+   Each point should directly guide the LLM on:
+   - Referencing the unit metadata (program/include/unit/lines).  
+   - Asking for minimal ECC-safe AFLE-related changes (no 7.4+ syntax).  
+   - Requiring JSON output with keys: original_code, remediated_code, changes[] (line, before, after, reason).
+
 
 Return ONLY strict JSON with keys:
 {{
