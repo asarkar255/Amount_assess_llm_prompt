@@ -12,7 +12,7 @@ if os.getenv("LANGCHAIN_API_KEY"):
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 if not OPENAI_API_KEY:
     raise RuntimeError("OPENAI_API_KEY environment variable is required (no fallback).")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")
 
 # LangChain + OpenAI
 from langchain_openai import ChatOpenAI
@@ -144,7 +144,7 @@ def llm_assess_and_prompt(unit: Unit) -> Dict[str, str]:
 
 # ====== API ======
 @app.post("/assess-and-prompt-amount")
-def assess_and_prompt_amount(units: List[Unit]) -> List[Dict[str, Any]]:
+async def assess_and_prompt_amount(units: List[Unit]) -> List[Dict[str, Any]]:
     """
     Input: array of units (with amount_findings[]).
     Output: same array, replacing 'amount_findings' with:
