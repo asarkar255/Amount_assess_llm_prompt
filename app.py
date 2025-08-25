@@ -2,7 +2,7 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from typing import List, Dict, Any, Optional
-import os, json
+import os, json, textwrap
 
 # ---- LLM is mandatory (no fallback) ----
 os.environ["LANGCHAIN_TRACING_V2"] = "true"
@@ -69,6 +69,39 @@ def summarize_amount_findings(unit: Unit) -> Dict[str, Any]:
         }
     }
 
+# ====== NEW: collect up to 6 unique, trimmed offending snippets ======
+def collect_critical_snippets(unit: Unit, max_snips: int = 6, max_chars: int = 240) -> List[str]:
+    seen = set()
+    out: List[str] = []
+    for f in (unit.amount_findings or []):
+        s = (f.snippet or "").strip()
+        if not s:
+            continue
+        # normalize whitespace/newlines for stable dedupe
+        norm = " ".join(s.split())
+        if not norm:
+            continue
+        if norm in seen:
+            continue
+        seen.add(norm)
+        # trim long snippets but keep verbatim feel
+        if len(s) > max_chars:
+            s = s[:max_chars].rstrip() + " …"
+        out.append(s)
+        if len(out) >= max_snips:
+            break
+    return out
+
+def render_snippets_block(snips: List[str]) -> str:
+    if not snips:
+        return "(none)"
+    # Render as a single ABAP code fence with numbered separators for high precision
+    lines = []
+    for idx, s in enumerate(snips, 1):
+        # keep snippet exactly as provided to maximize verbatim anchoring
+        lines.append(f"*[{idx}]* {s}")
+    return "\n".join(lines)
+
 # ====== LangChain prompt & chain (AFLE-focused) ======
 SYSTEM_MSG = "You are a precise ABAP remediation planner that outputs strict JSON only."
 
@@ -79,8 +112,7 @@ Goal:
 1) Turn 'amount_findings' into a concise, human-readable **assessment** paragraph for a reporting file (no code changes now).
    Summarize risks and why they matter for S/4HANA Amount Field Length Extension (AFLE).
    Consider guidance from SAP notes like 2628654 (S4TWL: Amount Field Length Extension), 2628040 (General info), and 2610650 (Code Adaptations).
-2) Produce a **remediation LLM prompt** to be used later.
-    The prompt must be concise, to the point, and contain **no more than 5 numbered bullet points**.  
+2) Produce a **remediation LLM prompt** to be used later. It must be concise and contain **no more than 5 numbered bullet points**:
    - Reference the unit metadata (program/include/unit).
    - Ask for minimal, behavior-preserving ECC-safe changes (no 7.4+ syntax) focused strictly on AFLE risks
      (e.g., type conflicts in modularization calls/Open SQL/LOOP/READ, MOVE/MOVE-CORRESPONDING issues,
@@ -89,16 +121,19 @@ Goal:
    - No business logic changes, no suppressions, no pseudo-comments.
 
 Return ONLY strict JSON with keys:
-{
+{{
   "assessment": "<concise assessment>",
-  "llm_prompt": "<prompt to use later>"
-}
+  "llm_prompt": "<prompt to use later as a single string>"
+}}
 
 Unit metadata:
 - Program: {pgm_name}
 - Include: {inc_name}
 - Unit type: {unit_type}
 - Unit name: {unit_name}
+
+Critical code snippets (verbatim, use these to tailor the prompt precisely):
+{snippets_block}
 
 ABAP code (optional; may be empty):
 {code}
@@ -126,6 +161,10 @@ def llm_assess_and_prompt(unit: Unit) -> Dict[str, str]:
     plan = summarize_amount_findings(unit)
     plan_json = json.dumps(plan, ensure_ascii=False, indent=2)
 
+    # NEW: inject up to 6 unique trimmed snippets
+    snippets = collect_critical_snippets(unit)
+    snippets_block = render_snippets_block(snippets)
+
     try:
         return chain.invoke(
             {
@@ -136,6 +175,7 @@ def llm_assess_and_prompt(unit: Unit) -> Dict[str, str]:
                 "code": unit.code or "",
                 "plan_json": plan_json,
                 "findings_json": findings_json,
+                "snippets_block": snippets_block,
             }
         )
     except Exception as e:
@@ -149,27 +189,19 @@ async def assess_and_prompt_amount(units: List[Unit]) -> List[Dict[str, Any]]:
     Input: array of units (with amount_findings[]).
     Output: same array, replacing 'amount_findings' with:
       - 'assessment' (string)
-      - 'llm_prompt' (string; normalized even if the model returns a list)
+      - 'llm_prompt' (single string, <=5 numbered bullets)
     """
     out: List[Dict[str, Any]] = []
     for u in units:
         obj = u.model_dump()
         llm_out = llm_assess_and_prompt(u)
-
-        # Copy assessment
         obj["assessment"] = llm_out.get("assessment", "")
-
-        # Normalize llm_prompt: if list → join into a single string
-        llm_prompt_val = llm_out.get("llm_prompt", "")
-        if isinstance(llm_prompt_val, list):
-            llm_prompt_val = "\n".join([p for p in llm_prompt_val if isinstance(p, str)])
-        elif not isinstance(llm_prompt_val, str):
-            llm_prompt_val = str(llm_prompt_val)
-
-        obj["llm_prompt"] = llm_prompt_val
-
-        # Remove findings as requested
-        obj.pop("amount_findings", None)
+        # Ensure llm_prompt is a STRING (not array); if model returns list, join lines safely
+        p = llm_out.get("llm_prompt", "")
+        if isinstance(p, list):
+            p = "\n".join(str(x) for x in p if x is not None)
+        obj["llm_prompt"] = p
+        obj.pop("amount_findings", None)  # remove as requested
         out.append(obj)
     return out
 
