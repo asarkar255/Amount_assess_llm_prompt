@@ -19,7 +19,7 @@ from langchain_openai import ChatOpenAI
 from langchain.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import JsonOutputParser
 
-app = FastAPI(title="AFLE Amount Assessment & LLM Prompt (LangChain, no fallback)")
+app = FastAPI(title="AFLE Amount Assessment & LLM Prompt (LangChain, suggestions+snippets grounded)")
 
 # ====== Models (amount version, no start/end lines in input) ======
 class Finding(BaseModel):
@@ -44,18 +44,46 @@ class Unit(BaseModel):
     code: Optional[str] = ""
     amount_findings: Optional[List[Finding]] = Field(default=None)
 
-# ====== Agentic planning helper (lite) ======
+# ====== Helpers to ground bullets in suggestions + snippets ======
+def _norm_snip(s: str, max_len: int = 160) -> str:
+    if not s:
+        return ""
+    # collapse whitespace and trim
+    s = " ".join(s.split())
+    return s if len(s) <= max_len else s[: max_len - 1] + "…"
+
+def _unique_preserve_order(items: List[str]) -> List[str]:
+    seen = set()
+    out = []
+    for it in items:
+        if not it:
+            continue
+        key = it.strip()
+        if key and key not in seen:
+            seen.add(key)
+            out.append(key)
+    return out
+
 def summarize_amount_findings(unit: Unit) -> Dict[str, Any]:
     findings = unit.amount_findings or []
     sev_counts, type_counts = {}, {}
-    examples = []
+    example_msgs, suggestions, snippets = [], [], []
     for f in findings:
         sev = (f.severity or "info").lower()
         sev_counts[sev] = sev_counts.get(sev, 0) + 1
         it = f.issue_type or "Unknown"
         type_counts[it] = type_counts.get(it, 0) + 1
         if f.message:
-            examples.append(f.message)
+            example_msgs.append(f.message)
+        if f.suggestion:
+            suggestions.append(f.suggestion)
+        if f.snippet:
+            snippets.append(_norm_snip(f.snippet))
+
+    # dedupe + cap for prompt hygiene
+    suggestions = _unique_preserve_order(suggestions)[:8]
+    snippets    = _unique_preserve_order(snippets)[:6]
+
     return {
         "program": unit.pgm_name,
         "include": unit.inc_name,
@@ -65,65 +93,37 @@ def summarize_amount_findings(unit: Unit) -> Dict[str, Any]:
             "count": len(findings),
             "severity_counts": sev_counts,
             "issue_type_counts": type_counts,
-            "example_messages": examples[:5],
+            "example_messages": _unique_preserve_order(example_msgs)[:5],
+        },
+        "grounding": {
+            "suggestions": suggestions,
+            "snippets": snippets,
         }
     }
 
-# ====== NEW: collect up to 6 unique, trimmed offending snippets ======
-def collect_critical_snippets(unit: Unit, max_snips: int = 6, max_chars: int = 240) -> List[str]:
-    seen = set()
-    out: List[str] = []
-    for f in (unit.amount_findings or []):
-        s = (f.snippet or "").strip()
-        if not s:
-            continue
-        # normalize whitespace/newlines for stable dedupe
-        norm = " ".join(s.split())
-        if not norm:
-            continue
-        if norm in seen:
-            continue
-        seen.add(norm)
-        # trim long snippets but keep verbatim feel
-        if len(s) > max_chars:
-            s = s[:max_chars].rstrip() + " …"
-        out.append(s)
-        if len(out) >= max_snips:
-            break
-    return out
-
-def render_snippets_block(snips: List[str]) -> str:
-    if not snips:
-        return "(none)"
-    # Render as a single ABAP code fence with numbered separators for high precision
-    lines = []
-    for idx, s in enumerate(snips, 1):
-        # keep snippet exactly as provided to maximize verbatim anchoring
-        lines.append(f"*[{idx}]* {s}")
-    return "\n".join(lines)
-
-# ====== LangChain prompt & chain (AFLE-focused) ======
+# ====== LangChain prompt & chain (AFLE-focused, grounded) ======
 SYSTEM_MSG = "You are a precise ABAP remediation planner that outputs strict JSON only."
 
 USER_TEMPLATE = """
 You are a senior ABAP reviewer and modernization planner.
 
 Goal:
-1) Turn 'amount_findings' into a concise, human-readable **assessment** paragraph for a reporting file (no code changes now).
-   Summarize risks and why they matter for S/4HANA Amount Field Length Extension (AFLE).
-   Consider guidance from SAP notes like 2628654 (S4TWL: Amount Field Length Extension), 2628040 (General info), and 2610650 (Code Adaptations).
-2) Produce a **remediation LLM prompt** to be used later. It must be concise and contain **no more than 5 numbered bullet points**:
-   - Reference the unit metadata (program/include/unit).
-   - Ask for minimal, behavior-preserving ECC-safe changes (no 7.4+ syntax) focused strictly on AFLE risks
-     (e.g., type conflicts in modularization calls/Open SQL/LOOP/READ, MOVE/MOVE-CORRESPONDING issues,
-      WRITE/WRITE TO layout, floating-point rounding, arithmetic error handling, hardcoded min/max, data clusters, ALV extracts).
-   - Require output JSON with keys: original_code, remediated_code, changes[] (line, before, after, reason).
-   - No business logic changes, no suppressions, no pseudo-comments.
+1) Create a concise, human-readable **assessment** paragraph summarizing AFLE risks (why they matter for S/4HANA AFLE).
+   Consider SAP notes like 2628654 (S4TWL: Amount Field Length Extension), 2628040 (General info), 2610650 (Code Adaptations).
+2) Produce a **remediation LLM prompt** for later automated edits.
+   - The prompt must be **concise** and contain **no more than 5 numbered bullets**.
+   - **Ground each bullet** using the provided `suggestion` and/or `snippet` when present.
+   - If a snippet exists, reference it explicitly using backticks around a short fragment.
+   - If a suggestion exists, use it as the action to request.
+   - Focus strictly on AFLE risks: type/length conflicts (MOVE/assignment/MOVE-CORRESPONDING), Open SQL INTO, LOOP/READ work areas,
+     WRITE/WRITE TO layout, floating rounding (F/DECFLOAT16), arithmetic error handling, hardcoded min/max, data clusters, ALV extracts.
+   - Require output JSON (later) with keys: original_code, remediated_code, changes[] (line, before, after, reason).
+   - **ECC-safe** (no 7.4+ features) and **no business logic changes**.
 
-Return ONLY strict JSON with keys:
+Return ONLY strict JSON:
 {{
   "assessment": "<concise assessment>",
-  "llm_prompt": "<prompt to use later as a single string>"
+  "llm_prompt": "<prompt as a single string (not an array), with ≤5 bullets>"
 }}
 
 Unit metadata:
@@ -132,18 +132,42 @@ Unit metadata:
 - Unit type: {unit_type}
 - Unit name: {unit_name}
 
-Critical code snippets (verbatim, use these to tailor the prompt precisely):
-{snippets_block}
-
 ABAP code (optional; may be empty):
 {code}
 
-Planning summary (agentic):
+Planning summary:
 {plan_json}
 
-amount_findings (JSON):
+# Grounding (use these explicitly)
+## Critical code snippets (trimmed, unique, up to 6)
+{critical_snippets}
+
+## Finding details (use suggestion + snippet where applicable)
+{findings_table}
+
+amount_findings (raw JSON):
 {findings_json}
 """.strip()
+
+def _format_findings_table(findings: List[Finding]) -> str:
+    if not findings:
+        return "(none)"
+    rows = []
+    for f in findings:
+        rows.append(
+            "- issue_type: {it}; severity: {sev}; suggestion: {sug}; snippet: `{snip}`".format(
+                it=f.issue_type or "Unknown",
+                sev=(f.severity or "info").lower(),
+                sug=(f.suggestion or "").strip(),
+                snip=_norm_snip(f.snippet or "")
+            )
+        )
+    return "\n".join(rows[:25])  # keep prompt small
+
+def _format_critical_snippets(snips: List[str]) -> str:
+    if not snips:
+        return "(none)"
+    return "\n".join(f"- `{s}`" for s in snips)
 
 prompt = ChatPromptTemplate.from_messages(
     [
@@ -157,16 +181,28 @@ parser = JsonOutputParser()
 chain = prompt | llm | parser
 
 def llm_assess_and_prompt(unit: Unit) -> Dict[str, str]:
-    findings_json = json.dumps([f.model_dump() for f in (unit.amount_findings or [])], ensure_ascii=False, indent=2)
+    # Keep full finding objects for table + raw JSON; also pass only the needed fields for clarity
+    findings_struct = unit.amount_findings or []
+    findings_min = [
+        {
+            "issue_type": f.issue_type,
+            "severity": f.severity,
+            "message": f.message,
+            "suggestion": f.suggestion,
+            "snippet": f.snippet,
+        }
+        for f in findings_struct
+    ]
+    findings_json = json.dumps(findings_min, ensure_ascii=False, indent=2)
+
     plan = summarize_amount_findings(unit)
     plan_json = json.dumps(plan, ensure_ascii=False, indent=2)
 
-    # NEW: inject up to 6 unique trimmed snippets
-    snippets = collect_critical_snippets(unit)
-    snippets_block = render_snippets_block(snippets)
+    critical_snippets = _format_critical_snippets(plan.get("grounding", {}).get("snippets", []))
+    findings_table = _format_findings_table(findings_struct)
 
     try:
-        return chain.invoke(
+        out = chain.invoke(
             {
                 "pgm_name": unit.pgm_name,
                 "inc_name": unit.inc_name,
@@ -174,10 +210,15 @@ def llm_assess_and_prompt(unit: Unit) -> Dict[str, str]:
                 "unit_name": unit.name or "",
                 "code": unit.code or "",
                 "plan_json": plan_json,
+                "critical_snippets": critical_snippets,
+                "findings_table": findings_table,
                 "findings_json": findings_json,
-                "snippets_block": snippets_block,
             }
         )
+        # Safety: some models may still (rarely) return array for llm_prompt
+        if isinstance(out, dict) and isinstance(out.get("llm_prompt"), list):
+            out["llm_prompt"] = "\n".join(str(x) for x in out["llm_prompt"])
+        return out
     except Exception as e:
         # hard fail (no fallback)
         raise HTTPException(status_code=502, detail=f"LLM call failed: {e}")
@@ -189,18 +230,14 @@ async def assess_and_prompt_amount(units: List[Unit]) -> List[Dict[str, Any]]:
     Input: array of units (with amount_findings[]).
     Output: same array, replacing 'amount_findings' with:
       - 'assessment' (string)
-      - 'llm_prompt' (single string, <=5 numbered bullets)
+      - 'llm_prompt' (string; grounded bullets using suggestion+snippet)
     """
     out: List[Dict[str, Any]] = []
     for u in units:
         obj = u.model_dump()
         llm_out = llm_assess_and_prompt(u)
         obj["assessment"] = llm_out.get("assessment", "")
-        # Ensure llm_prompt is a STRING (not array); if model returns list, join lines safely
-        p = llm_out.get("llm_prompt", "")
-        if isinstance(p, list):
-            p = "\n".join(str(x) for x in p if x is not None)
-        obj["llm_prompt"] = p
+        obj["llm_prompt"]  = llm_out.get("llm_prompt", "")
         obj.pop("amount_findings", None)  # remove as requested
         out.append(obj)
     return out
